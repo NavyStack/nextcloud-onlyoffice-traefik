@@ -1,0 +1,10 @@
+################################################################
+#
+# Dynamic configuration for Traefik v2.
+#
+################################################################
+
+tls:
+  certificates:
+    - certFile: "/etc/traefik/certs/example.com_ecc/fullchain.cer" # 여기는 도커에서 마운트한 Traefik 안의 경로임
+      keyFile: "/etc/traefik/certs/example.com_ecc/example.com.key" # 여기는 도커에서 마운트한 Traefik 안의 경로임

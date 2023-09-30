@@ -1,0 +1,256 @@
+version: "3.7"
+services:
+  traefik:
+    image: ${TRAEFIK_IMAGE_TAG}
+    command:
+      - "--log.level=${TRAEFIK_LOG_LEVEL}"
+      - "--accesslog=true"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entryPoints.ping.address=:8082"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--providers.docker.exposedByDefault=false"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=${TRAEFIK_ACME_EMAIL}"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/etc/traefik/acme/acme.json"
+      #- "--certificatesresolvers.letsencrypt.acme.caserver=https://acme-staging-v02.api.letsencrypt.org/directory" #테스트용
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+      - "--global.checkNewVersion=true"
+      - "--global.sendAnonymousUsage=false"
+      - "--experimental.http3=true" # QUIC 활성화
+      - "--entrypoints.websecure.http3" # QUIC 활성화
+      - "--entrypoints.websecure.http3.advertisedport=443" # QUIC 활성화
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - traefik-certificates:/etc/traefik/acme
+      #- ./traefik/ssl.yml:/etc/traefik/ssl.yml # 다이나믹으로 인증서 로드
+      #- ./acme/:/etc/traefik/certs # 도커에 넣을 인증서의 위치
+    networks:
+      - traefik-network
+    ports:
+      - "80:80"
+      - "443:443/tcp"
+      - "443:443/udp" # QUIC 활성화
+
+    healthcheck:
+      test: ["CMD", "wget", "http://localhost:8082/ping","--spider"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=8080"
+      - "traefik.http.services.dashboard.loadbalancer.passhostheader=true"
+
+      - "traefik.http.routers.dashboard.rule=Host(`${TRAEFIK_HOSTNAME}`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.dashboard.middlewares=authtraefik"
+
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+
+      - "traefik.http.middlewares.authtraefik.basicauth.users=${TRAEFIK_BASIC_AUTH}"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+
+    restart: unless-stopped
+
+  postgres:
+    image: ${NEXTCLOUD_POSTGRES_IMAGE_TAG}
+    volumes:
+      - nextcloud-postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: ${NEXTCLOUD_DB_NAME}
+      POSTGRES_USER: ${NEXTCLOUD_DB_USER}
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+    networks:
+      - nextcloud-network
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-q", "-d", "${NEXTCLOUD_DB_NAME}", "-U", "${NEXTCLOUD_DB_USER}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  redis:
+    image: ${NEXTCLOUD_REDIS_IMAGE_TAG}
+    command: ["redis-server", "--requirepass", "$NEXTCLOUD_REDIS_PASSWORD"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - nextcloud-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  nextcloud:
+    image: ${NEXTCLOUD_IMAGE_TAG}
+    volumes:
+      - nextcloud-data:/var/www/html
+    environment:
+      TZ: ${NEXTCLOUD_TIMEZONE}
+      POSTGRES_HOST: postgres
+      DB_PORT: 5432
+      POSTGRES_DB: ${NEXTCLOUD_DB_NAME}
+      POSTGRES_USER: ${NEXTCLOUD_DB_USER}
+      POSTGRES_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_HOST_PORT: 6379
+      REDIS_HOST_PASSWORD: ${NEXTCLOUD_REDIS_PASSWORD}
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USERNAME}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      NEXTCLOUD_TRUSTED_DOMAINS: ${NEXTCLOUD_HOSTNAME}
+      TRUSTED_PROXIES: ${NEXTCLOUD_HOSTNAME}
+      OVERWRITECLIURL: ${NEXTCLOUD_URL}
+      OVERWRITEPROTOCOL: https
+      OVERWRITEHOST: ${NEXTCLOUD_HOSTNAME}
+      PHP_MEMORY_LIMIT: 4G
+      PHP_UPLOAD_LIMIT: 10G
+    networks:
+      - nextcloud-network
+      - traefik-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+
+      - "traefik.http.services.nextcloud.loadbalancer.server.port=80"
+      - "traefik.http.services.nextcloud.loadbalancer.passhostheader=true"
+
+      - "traefik.http.routers.nextcloud.tls=true"
+      - "traefik.http.routers.nextcloud.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nextcloud.rule=Host(`${NEXTCLOUD_HOSTNAME}`)"
+      - "traefik.http.routers.nextcloud.service=nextcloud"
+      - "traefik.http.routers.nextcloud.entrypoints=websecure"
+
+      - "traefik.http.routers.nextcloud.middlewares=compresstraefik,nextcloudredir,nextcloudsts"
+
+      - "traefik.http.middlewares.compresstraefik.compress=true"
+
+      - "traefik.http.middlewares.nextcloudredir.redirectregex.permanent=true"
+      - "traefik.http.middlewares.nextcloudredir.redirectregex.regex=https://(.*)/.well-known/(card|cal)dav"
+      - "traefik.http.middlewares.nextcloudredir.redirectregex.replacement=https://$$1/remote.php/dav/"
+
+      - "traefik.http.middlewares.nextcloudsts.headers.stsincludesubdomains=false"
+      - "traefik.http.middlewares.nextcloudsts.headers.stspreload=true"
+      - "traefik.http.middlewares.nextcloudsts.headers.stsseconds=31536000"
+      - "traefik.http.middlewares.nextcloudsts.headers.isdevelopment=false"
+      - "traefik.http.middlewares.nextcloudsts.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.nextcloudsts.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.nextcloudsts.headers.forceSTSHeader=true"
+      - "traefik.http.middlewares.nextcloudsts.headers.customresponseheaders.X-Powered-By="
+      - "traefik.http.middlewares.nextcloudsts.headers.customResponseHeaders.Server="
+
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      traefik:
+        condition: service_healthy
+
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
+    volumes:
+      - onlyoffice-data:/var/www/onlyoffice/Data
+      - onlyoffice-logs:/var/log/onlyoffice
+    environment:
+      JWT_ENABLED: true
+      JWT_SECRET: ${ONLYOFFICE_SECRET}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-network"
+      - "traefik.http.services.onlyoffice.loadbalancer.server.port=80"
+      - "traefik.http.services.onlyoffice.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.onlyoffice.rule=Host(`${ONLYOFFICE_HOSTNAME}`)"
+      - "traefik.http.routers.onlyoffice.service=onlyoffice"
+      - "traefik.http.routers.onlyoffice.entrypoints=websecure"
+      - "traefik.http.routers.onlyoffice.tls=true"
+      - "traefik.http.routers.onlyoffice.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.onlyoffice.middlewares=compresstraefik,onlyoffice"
+      - "traefik.http.middlewares.compresstraefik.compress=true"
+      - "traefik.http.middlewares.onlyoffice.headers.customResponseHeaders.Server="
+
+    restart: unless-stopped
+    networks:
+      - nextcloud-network
+      - traefik-network
+
+  cron: 
+    image: ${NEXTCLOUD_IMAGE_TAG}
+    restart: always
+    volumes:
+      - nextcloud-data:/var/www/html
+    entrypoint: /cron.sh
+    networks:
+      - nextcloud-network
+
+networks:
+  nextcloud-network:
+    external: true
+  traefik-network:
+    external: true
+
+volumes:
+  nextcloud-data:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/nextcloud_data
+
+  redis-data:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/redis_data
+
+  nextcloud-postgres:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/nextcloud_postgres_data
+
+  traefik-certificates:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/traefik_certificates_data
+
+  onlyoffice-data:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/onlyoffice_data
+
+  onlyoffice-logs:
+    driver: local
+    driver_opts:
+      o: bind
+      type: none
+      device: /data/onlyoffice_logs_data
